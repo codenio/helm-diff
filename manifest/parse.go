@@ -4,24 +4,128 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
+	"regexp"
 	"strings"
 
-	yaml "gopkg.in/yaml.v2"
-	"k8s.io/helm/pkg/proto/hapi/release"
+	jsoniter "github.com/json-iterator/go"
+	"gopkg.in/yaml.v2"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
-	hookAnnotation = "helm.sh/hook"
+	hookAnnotation           = "helm.sh/hook"
+	resourcePolicyAnnotation = "helm.sh/resource-policy"
 )
 
 var yamlSeparator = []byte("\n---\n")
 
+// metadataLineRegex matches the top-level `metadata:` key of a manifest.
+var metadataLineRegex = regexp.MustCompile(`^metadata:[ \t]*(#.*)?$`)
+
+// stripEmptyMetadataKeys removes `labels:`/`annotations:` lines from content
+// when their value is null or an empty mapping.
+//
+// Kubernetes treats a null or empty labels/annotations map exactly like an
+// absent one, but charts frequently render the (empty) key anyway, e.g. via a
+// conditional block:
+//
+//	metadata:
+//	  name: example
+//	  labels:
+//
+// A raw textual diff between such a manifest and one that omits the key
+// reports a meaningless `- labels:` change. The removal is done line-based so
+// the surrounding text keeps its original formatting; the parsed document is
+// only consulted to confirm that the key really is null/empty (a `labels:`
+// line followed by indented entries is left alone).
+//
+// See https://github.com/databus23/helm-diff/issues/1064
+func stripEmptyMetadataKeys(content []byte) []byte {
+	var doc map[interface{}]interface{}
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return content
+	}
+
+	metadata, ok := doc["metadata"].(map[interface{}]interface{})
+	if !ok {
+		return content
+	}
+
+	strip := map[string]bool{}
+	for _, key := range []string{"labels", "annotations"} {
+		value, exists := metadata[key]
+		if !exists {
+			continue
+		}
+		if value == nil {
+			strip[key] = true
+			continue
+		}
+		if m, ok := value.(map[interface{}]interface{}); ok && len(m) == 0 {
+			strip[key] = true
+		}
+	}
+	if len(strip) == 0 {
+		return content
+	}
+
+	lines := strings.Split(string(content), "\n")
+
+	// Determine the indentation of metadata's direct children by looking at
+	// the first non-blank line below the top-level `metadata:` key.
+	childIndent := -1
+	for i, line := range lines {
+		if !metadataLineRegex.MatchString(line) {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			if strings.TrimSpace(lines[j]) == "" {
+				continue
+			}
+			if indent := len(lines[j]) - len(strings.TrimLeft(lines[j], " \t")); indent > 0 {
+				childIndent = indent
+			}
+			break
+		}
+		break
+	}
+	if childIndent <= 0 {
+		return content
+	}
+
+	keyLine := func(key string) *regexp.Regexp {
+		return regexp.MustCompile(fmt.Sprintf(`^ {%d}%s:[ \t]*(\{\}[ \t]*)?(#.*)?$`, childIndent, key))
+	}
+	regexes := make([]*regexp.Regexp, 0, len(strip))
+	for key := range strip {
+		regexes = append(regexes, keyLine(key))
+	}
+
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		drop := false
+		for _, re := range regexes {
+			if re.MatchString(line) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			kept = append(kept, line)
+		}
+	}
+
+	return []byte(strings.Join(kept, "\n"))
+}
+
 // MappingResult to store result of diff
 type MappingResult struct {
-	Name    string
-	Kind    string
-	Content string
+	Name           string
+	Kind           string
+	Content        string
+	ResourcePolicy string
 }
 
 type metadata struct {
@@ -40,8 +144,13 @@ func (m metadata) String() string {
 	if len(sp) > 1 {
 		apiBase = strings.Join(sp[:len(sp)-1], "/")
 	}
-
-	return fmt.Sprintf("%s, %s, %s (%s)", m.Metadata.Namespace, m.Metadata.Name, m.Kind, apiBase)
+	name := m.Metadata.Name
+	if a := m.Metadata.Annotations; a != nil {
+		if baseName, ok := a["helm-diff/base-name"]; ok {
+			name = baseName
+		}
+	}
+	return fmt.Sprintf("%s, %s, %s (%s)", m.Metadata.Namespace, name, m.Kind, apiBase)
 }
 
 func scanYamlSpecs(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -60,43 +169,18 @@ func scanYamlSpecs(data []byte, atEOF bool) (advance int, token []byte, err erro
 	return 0, nil, nil
 }
 
-func splitSpec(token string) (string, string) {
-	if i := strings.Index(token, "\n"); i >= 0 {
-		return token[0:i], token[i+1:]
-	}
-	return "", ""
-}
-
-// ParseRelease parses release objects into MappingResult
-func ParseRelease(release *release.Release, includeTests bool, normalizeManifests bool) map[string]*MappingResult {
-	manifest := release.Manifest
-	for _, hook := range release.Hooks {
-		if !includeTests && isTestHook(hook.Events) {
-			continue
-		}
-
-		manifest += "\n---\n"
-		manifest += fmt.Sprintf("# Source: %s\n", hook.Path)
-		manifest += hook.Manifest
-	}
-	return Parse(manifest, release.Namespace, normalizeManifests)
-}
-
-// Parse parses manifest strings into MappingResult
-func Parse(manifest string, defaultNamespace string, normalizeManifests bool, excludedHooks ...string) map[string]*MappingResult {
-	// Ensure we have a newline in front of the yaml separator
-	scanner := bufio.NewScanner(strings.NewReader("\n" + manifest))
+// Parse parses manifest bytes into MappingResult
+func Parse(manifest []byte, defaultNamespace string, normalizeManifests bool, excludedHooks ...string) map[string]*MappingResult {
+	scanner := bufio.NewScanner(io.MultiReader(strings.NewReader("\n"), bytes.NewReader(manifest)))
 	scanner.Split(scanYamlSpecs)
 	// Allow for tokens (specs) up to 10MiB in size
 	scanner.Buffer(make([]byte, bufio.MaxScanTokenSize), 10485760)
-	// Discard the first result, we only care about everything after the first separator
-	scanner.Scan()
 
 	result := make(map[string]*MappingResult)
 
 	for scanner.Scan() {
-		content := strings.TrimSpace(scanner.Text())
-		if content == "" {
+		content := bytes.TrimSpace(scanner.Bytes())
+		if len(content) == 0 {
 			continue
 		}
 
@@ -121,9 +205,51 @@ func Parse(manifest string, defaultNamespace string, normalizeManifests bool, ex
 	return result
 }
 
-func parseContent(content string, defaultNamespace string, normalizeManifests bool, excludedHooks ...string) ([]*MappingResult, error) {
+func ParseObject(object runtime.Object, defaultNamespace string, excludedHooks ...string) (*MappingResult, string, error) {
+	json, _ := jsoniter.ConfigCompatibleWithStandardLibrary.Marshal(object)
+	var objectMap map[string]interface{}
+	err := jsoniter.Unmarshal(json, &objectMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("could not unmarshal byte sequence: %w", err)
+	}
+
+	metadata := objectMap["metadata"].(map[string]interface{})
+	var oldRelease string
+	if a := metadata["annotations"]; a != nil {
+		annotations := a.(map[string]interface{})
+		if releaseNs, ok := annotations["meta.helm.sh/release-namespace"].(string); ok {
+			oldRelease += releaseNs + "/"
+		}
+		if releaseName, ok := annotations["meta.helm.sh/release-name"].(string); ok {
+			oldRelease += releaseName
+		}
+	}
+
+	// Clean namespace metadata as it exists in Kubernetes but not in Helm manifest
+	purgedObj, _ := deleteStatusAndTidyMetadata(json)
+
+	content, err := yaml.Marshal(purgedObj)
+	if err != nil {
+		return nil, "", err
+	}
+
+	result, err := parseContent(content, defaultNamespace, true, excludedHooks...)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if len(result) != 1 {
+		return nil, "", fmt.Errorf("failed to parse content of Kubernetes resource %s", metadata["name"])
+	}
+
+	result[0].Content = strings.TrimSuffix(result[0].Content, "\n")
+
+	return result[0], oldRelease, nil
+}
+
+func parseContent(content []byte, defaultNamespace string, normalizeManifests bool, excludedHooks ...string) ([]*MappingResult, error) {
 	var parsedMetadata metadata
-	if err := yaml.Unmarshal([]byte(content), &parsedMetadata); err != nil {
+	if err := yaml.Unmarshal(content, &parsedMetadata); err != nil {
 		log.Fatalf("YAML unmarshal error: %s\nCan't unmarshal %s", err, content)
 	}
 
@@ -133,14 +259,14 @@ func parseContent(content string, defaultNamespace string, normalizeManifests bo
 		return nil, nil
 	}
 
-	if parsedMetadata.Kind == "List" {
+	if strings.HasSuffix(parsedMetadata.Kind, "List") {
 		type ListV1 struct {
 			Items []yaml.MapSlice `yaml:"items"`
 		}
 
 		var list ListV1
 
-		if err := yaml.Unmarshal([]byte(content), &list); err != nil {
+		if err := yaml.Unmarshal(content, &list); err != nil {
 			log.Fatalf("YAML unmarshal error: %s\nCan't unmarshal %s", err, content)
 		}
 
@@ -152,9 +278,9 @@ func parseContent(content string, defaultNamespace string, normalizeManifests bo
 				log.Printf("YAML marshal error: %s\nCan't marshal %v", err, item)
 			}
 
-			subs, err := parseContent(string(subcontent), defaultNamespace, normalizeManifests, excludedHooks...)
+			subs, err := parseContent(subcontent, defaultNamespace, normalizeManifests, excludedHooks...)
 			if err != nil {
-				return nil, fmt.Errorf("Parsing YAML list item: %v", err)
+				return nil, fmt.Errorf("Parsing YAML list item: %w", err)
 			}
 
 			result = append(result, subs...)
@@ -164,19 +290,18 @@ func parseContent(content string, defaultNamespace string, normalizeManifests bo
 	}
 
 	if normalizeManifests {
-		// Unmarshal and marshal again content to normalize yaml structure
-		// This avoids style differences to show up as diffs but it can
-		// make the output different from the original template (since it is in normalized form)
-		var object map[interface{}]interface{}
-		if err := yaml.Unmarshal([]byte(content), &object); err != nil {
-			log.Fatalf("YAML unmarshal error: %s\nCan't unmarshal %s", err, content)
+		var normalizeErr error
+		content, normalizeErr = normalizeContent(content)
+		if normalizeErr != nil {
+			log.Fatalf("Error normalizing manifests: %v", normalizeErr)
 		}
-		normalizedContent, err := yaml.Marshal(object)
-		if err != nil {
-			log.Fatalf("YAML marshal error: %s\nCan't marshal %v", err, object)
-		}
-		content = string(normalizedContent)
 	}
+
+	// Remove `labels:`/`annotations:` keys that are null or empty: they are
+	// semantically identical to an absent key, yet a textual diff between a
+	// manifest rendering the empty key and one omitting it would otherwise
+	// report a meaningless change (#1064).
+	content = stripEmptyMetadataKeys(content)
 
 	if isHook(parsedMetadata, excludedHooks...) {
 		return nil, nil
@@ -189,11 +314,27 @@ func parseContent(content string, defaultNamespace string, normalizeManifests bo
 	name := parsedMetadata.String()
 	return []*MappingResult{
 		{
-			Name:    name,
-			Kind:    parsedMetadata.Kind,
-			Content: content,
+			Name:           name,
+			Kind:           parsedMetadata.Kind,
+			Content:        string(content),
+			ResourcePolicy: parsedMetadata.Metadata.Annotations[resourcePolicyAnnotation],
 		},
 	}, nil
+}
+
+func normalizeContent(content []byte) ([]byte, error) {
+	// Unmarshal and marshal again content to normalize yaml structure
+	// This avoids style differences to show up as diffs but it can
+	// make the output different from the original template (since it is in normalized form)
+	var object map[interface{}]interface{}
+	if err := yaml.Unmarshal(content, &object); err != nil {
+		return nil, err
+	}
+	normalizedContent, err := yaml.Marshal(object)
+	if err != nil {
+		return nil, err
+	}
+	return normalizedContent, nil
 }
 
 func isHook(metadata metadata, hooks ...string) bool {
@@ -202,15 +343,5 @@ func isHook(metadata metadata, hooks ...string) bool {
 			return true
 		}
 	}
-	return false
-}
-
-func isTestHook(hookEvents []release.Hook_Event) bool {
-	for _, event := range hookEvents {
-		if event == release.Hook_RELEASE_TEST_FAILURE || event == release.Hook_RELEASE_TEST_SUCCESS {
-			return true
-		}
-	}
-
 	return false
 }

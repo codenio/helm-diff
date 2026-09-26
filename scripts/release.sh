@@ -1,18 +1,11 @@
-#!/usr/bin/env bash
-set -x
+#!/usr/bin/env sh
+set -e
 
-if [ ! -f bin/github-release ]; then
-  OS=$(uname)
-  curl -L https://github.com/aktau/github-release/releases/download/v0.7.2/$OS-amd64-github-release.tar.bz2 | tar -C bin/ -jvx --strip-components=3
+# == would end up with: scripts/release.sh: 5: [: v3.8.1: unexpected operator
+if [ "$1" = "" ]; then
+  echo usage: "$0 VERSION"
 fi
 
-user=databus23
-repo=helm-diff
-tag=$1
-commit=$2
-
-bin/github-release release -u $user -r $repo -t $tag -c $commit -n $tag
-
-for f in $(ls release); do
-  bin/github-release upload -u $user -r $repo -t $tag -n $f -f release/$f
-done
+git tag $1
+git push origin $1
+gh release create $1 --draft --generate-notes --title "$1" release/*.tgz

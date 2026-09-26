@@ -10,20 +10,15 @@ export GREP_COLOR="never"
 # available. This is the case when using MSYS2 or Cygwin
 # on Windows where helm returns a Windows path but we
 # need a Unix path
-
-if type cygpath >/dev/null 2>&1; then
+if command -v cygpath >/dev/null 2>&1; then
   HELM_BIN="$(cygpath -u "${HELM_BIN}")"
   HELM_PLUGIN_DIR="$(cygpath -u "${HELM_PLUGIN_DIR}")"
 fi
 
 [ -z "$HELM_BIN" ] && HELM_BIN=$(command -v helm)
-HELM_MAJOR_VERSION=$("${HELM_BIN}" version --client --short | awk -F '.' '{print $1}')
-
-[ -z "$HELM_HOME" ] && HELM_HOME=$(helm env | grep 'HELM_DATA_HOME' | cut -d '=' -f2 | tr -d '"')
-
+[ -z "$HELM_HOME" ] && HELM_HOME=$($HELM_BIN env | grep 'HELM_DATA_HOME' | cut -d '=' -f2 | tr -d '"')
 mkdir -p "$HELM_HOME"
-
-: ${HELM_PLUGIN_DIR:="$HELM_HOME/plugins/helm-diff"}
+: "${HELM_PLUGIN_DIR:="$HELM_HOME/plugins/helm-diff"}"
 
 if [ "$SKIP_BIN_INSTALL" = "1" ]; then
   echo "Skipping binary install"
@@ -48,41 +43,52 @@ initArch() {
   x86_64) ARCH="amd64" ;;
   i686) ARCH="386" ;;
   i386) ARCH="386" ;;
+  ppc64le) ARCH="ppc64le" ;;
+  s390x) ARCH="s390x" ;;
   esac
 }
 
 # initOS discovers the operating system for this system.
 initOS() {
-  OS=$(uname | tr '[:upper:]' '[:lower:]')
-
+  OS=$(uname -s)
   case "$OS" in
+  Windows_NT) OS='windows' ;;
   # Msys support
-  msys*) OS='windows' ;;
+  MSYS*) OS='windows' ;;
   # Minimalist GNU for Windows
-  mingw*) OS='windows' ;;
-  darwin) OS='macos' ;;
+  MINGW*) OS='windows' ;;
+  CYGWIN*) OS='windows' ;;
+  Darwin) OS='macos' ;;
+  Linux) OS='linux' ;;
   esac
 }
 
 # verifySupported checks that the os/arch combination is supported for
 # binary builds.
 verifySupported() {
-  supported="linux-amd64\nlinux-arm64\nfreebsd-amd64\nmacos-amd64\nmacos-arm64\nwindows-amd64"
+  supported="linux-amd64\nlinux-arm64\nlinux-armv6\nlinux-armv7\nlinux-ppc64le\nlinux-s390x\nfreebsd-amd64\nfreebsd-arm64\nmacos-amd64\nmacos-arm64\nwindows-amd64\nwindows-arm64"
   if ! echo "${supported}" | grep -q "${OS}-${ARCH}"; then
     echo "No prebuild binary for ${OS}-${ARCH}."
     exit 1
   fi
 
-  if ! type "curl" >/dev/null && ! type "wget" >/dev/null; then
-    echo "Either curl or wget is required"
-    exit 1
+  # Skip download tool check if using local file
+  if [ -z "$HELM_DIFF_BIN_TGZ" ]; then
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      echo "Either curl or wget is required"
+      exit 1
+    fi
   fi
 }
 
 # getDownloadURL checks the latest available version.
 getDownloadURL() {
+  # If HELM_DIFF_BIN_TGZ is set, we don't need a download URL
+  if [ -n "$HELM_DIFF_BIN_TGZ" ]; then
+    return
+  fi
   version=$(git -C "$HELM_PLUGIN_DIR" describe --tags --exact-match 2>/dev/null || :)
-  if [ "$SCRIPT_MODE" = "install" -a -n "$version" ]; then
+  if [ "$SCRIPT_MODE" = "install" ] && [ -n "$version" ]; then
     DOWNLOAD_URL="https://github.com/$PROJECT_GH/releases/download/$version/helm-diff-$OS-$ARCH.tgz"
   else
     DOWNLOAD_URL="https://github.com/$PROJECT_GH/releases/latest/download/helm-diff-$OS-$ARCH.tgz"
@@ -93,6 +99,7 @@ getDownloadURL() {
 mkTempDir() {
   HELM_TMP="$(mktemp -d -t "${PROJECT_NAME}-XXXXXX")"
 }
+
 rmTempDir() {
   if [ -d "${HELM_TMP:-/tmp/helm-diff-tmp}" ]; then
     rm -rf "${HELM_TMP:-/tmp/helm-diff-tmp}"
@@ -102,20 +109,72 @@ rmTempDir() {
 # downloadFile downloads the latest binary package and also the checksum
 # for that binary.
 downloadFile() {
-  PLUGIN_TMP_FILE="${HELM_TMP}/${PROJECT_NAME}.tgz"
+  # If HELM_DIFF_BIN_TGZ is set, copy the local file instead of downloading.
+  # Keep its original file name: the 3.15.14 release archives wrapped their
+  # content in a directory named after the archive, which installFile locates
+  # via the file name (see below).
+  if [ -n "$HELM_DIFF_BIN_TGZ" ]; then
+    echo "Using local package at $HELM_DIFF_BIN_TGZ"
+    if [ ! -f "$HELM_DIFF_BIN_TGZ" ]; then
+      echo "Error: file not found at $HELM_DIFF_BIN_TGZ"
+      exit 1
+    fi
+    PLUGIN_TMP_FILE="${HELM_TMP}/$(basename "$HELM_DIFF_BIN_TGZ")"
+    cp "$HELM_DIFF_BIN_TGZ" "$PLUGIN_TMP_FILE"
+    return
+  fi
+
+  PLUGIN_TMP_FILE="${HELM_TMP}/helm-diff-${OS}-${ARCH}.tgz"
   echo "Downloading $DOWNLOAD_URL"
-  if type "curl" >/dev/null; then
-    curl -L "$DOWNLOAD_URL" -o "$PLUGIN_TMP_FILE"
-  elif type "wget" >/dev/null; then
-    wget -q -O "$PLUGIN_TMP_FILE" "$DOWNLOAD_URL"
+  # Retry with backoff to absorb transient failures, e.g. a release window
+  # where the "latest" asset is already published but not fully uploaded yet.
+  dl_attempts=5
+  dl_attempt=1
+  dl_ok=0
+  while [ "$dl_attempt" -le "$dl_attempts" ]; do
+    if command -v curl >/dev/null 2>&1; then
+      if curl -sSfL "$DOWNLOAD_URL" >"$PLUGIN_TMP_FILE"; then
+        dl_ok=1
+        break
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -q -O "$PLUGIN_TMP_FILE" "$DOWNLOAD_URL"; then
+        dl_ok=1
+        break
+      fi
+    else
+      echo "Either curl or wget is required"
+      exit 1
+    fi
+    echo "Download failed (attempt $dl_attempt/$dl_attempts), retrying in $((dl_attempt * 3))s..."
+    sleep "$((dl_attempt * 3))"
+    dl_attempt=$((dl_attempt + 1))
+  done
+  if [ "$dl_ok" -ne 1 ]; then
+    echo "Error: failed to download $DOWNLOAD_URL after $dl_attempts attempts"
+    exit 1
   fi
 }
 
-# installFile verifies the SHA256 for the file, then unpacks and
-# installs it.
+# Unpack the archive file, then install it into the helm directory.
 installFile() {
-  tar xvzf "$PLUGIN_TMP_FILE" -C "$HELM_TMP"
-  HELM_TMP_BIN="$HELM_TMP/diff/bin/diff"
+  tar xzf "$PLUGIN_TMP_FILE" -C "$HELM_TMP"
+  bin="diff"
+  if [ "${OS}" = "windows" ]; then
+    bin="$bin.exe"
+  fi
+  # Release archives wrap their content in a "diff/" directory — the layout
+  # the install/update hooks of every released version expect when they
+  # download a tarball, so it must not change (issue #1076). The 3.15.14
+  # release instead wrapped the content in a directory named after the
+  # archive itself (e.g. helm-diff-linux-amd64/bin/diff), as required by
+  # helm 4 when installing directly from a tarball (issue #1071); support
+  # that layout as well so 3.15.14 tarballs keep installing and updating.
+  wrap_dir="$(basename "$PLUGIN_TMP_FILE" .tgz)"
+  HELM_TMP_BIN="$HELM_TMP/$wrap_dir/bin/$bin"
+  if [ ! -f "$HELM_TMP_BIN" ] && [ -f "$HELM_TMP/diff/bin/$bin" ]; then
+    HELM_TMP_BIN="$HELM_TMP/diff/bin/$bin"
+  fi
   echo "Preparing to install into ${HELM_PLUGIN_DIR}"
   mkdir -p "$HELM_PLUGIN_DIR/bin"
   cp "$HELM_TMP_BIN" "$HELM_PLUGIN_DIR/bin"
@@ -132,24 +191,33 @@ exit_trap() {
   exit $result
 }
 
-# testVersion tests the installed client to make sure it is working.
-testVersion() {
-  set +e
-  echo "$PROJECT_NAME installed into $HELM_PLUGIN_DIR/$PROJECT_NAME"
-  "${HELM_PLUGIN_DIR}/bin/diff" -h
-  set -e
+# alreadyInstalled returns 0 when the platform binary is already staged in
+# the plugin dir. This is the case when installing from a release archive
+# (which bundles the correct platform binary), so the redundant download
+# can be skipped. Update mode always re-downloads.
+alreadyInstalled() {
+  [ "$SCRIPT_MODE" = "install" ] || return 1
+  bin="$HELM_PLUGIN_DIR/bin/diff"
+  [ "$OS" = "windows" ] && bin="$bin.exe"
+  [ -x "$bin" ]
 }
 
-# Execution
-
-#Stop execution on any error
+# --- Execution ---
+# Stop execution on any error
 trap "exit_trap" EXIT
 set -e
+
 initArch
 initOS
 verifySupported
+
+if alreadyInstalled; then
+  echo "Binary already present at $HELM_PLUGIN_DIR/bin/diff, skipping download"
+  trap - EXIT
+  exit 0
+fi
+
 getDownloadURL
 mkTempDir
 downloadFile
 installFile
-testVersion

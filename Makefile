@@ -1,14 +1,12 @@
-HELM_HOME ?= $(shell helm home)
+HELM_HOME ?= $(shell helm env HELM_DATA_HOME)
 VERSION := $(shell sed -n -e 's/version:[ "]*\([^"]*\).*/\1/p' plugin.yaml)
 
-HELM_3_PLUGINS := $(shell bash -c 'eval $$(helm env); echo $$HELM_PLUGINS')
+HELM_PLUGINS := $(shell helm env HELM_PLUGINS)
 
 PKG:= github.com/databus23/helm-diff/v3
 LDFLAGS := -X $(PKG)/cmd.Version=$(VERSION)
 
-# Clear the "unreleased" string in BuildMetadata
-LDFLAGS += -X k8s.io/helm/pkg/version.BuildMetadata=
-LDFLAGS += -X k8s.io/helm/pkg/version.Version=$(shell ./scripts/dep-helm-version.sh)
+GO ?= go
 
 .PHONY: format
 format:
@@ -21,17 +19,16 @@ install: build
 	cp bin/diff $(HELM_HOME)/plugins/helm-diff/bin
 	cp plugin.yaml $(HELM_HOME)/plugins/helm-diff/
 
-.PHONY: install/helm3
-install/helm3: build
-	mkdir -p $(HELM_3_PLUGINS)/helm-diff/bin
-	cp bin/diff $(HELM_3_PLUGINS)/helm-diff/bin
-	cp plugin.yaml $(HELM_3_PLUGINS)/helm-diff/
+.PHONY: install/helm
+install/helm: build
+	mkdir -p $(HELM_PLUGINS)/helm-diff/bin
+	cp bin/diff $(HELM_PLUGINS)/helm-diff/bin
+	cp plugin.yaml $(HELM_PLUGINS)/helm-diff/
 
 .PHONY: lint
 lint:
 	scripts/update-gofmt.sh
 	scripts/verify-gofmt.sh
-	scripts/verify-golint.sh
 	scripts/verify-govet.sh
 
 .PHONY: build
@@ -41,47 +38,79 @@ build: lint
 
 .PHONY: test
 test:
-	go test -v ./...
+	go test -v ./... -coverprofile cover.out -race
+	go tool cover -func cover.out
 
-.PHONY: bootstrap
-bootstrap:
-	go mod download
-	command -v golint || GO111MODULE=off go get -u golang.org/x/lint/golint
+.PHONY: readme
+readme: build
+	scripts/gen-readme.sh bin/diff
+
+.PHONY: verify-readme
+verify-readme: build
+	scripts/gen-readme.sh bin/diff
+	git diff --exit-code README.md
 
 .PHONY: docker-run-release
 docker-run-release: export pkg=/go/src/github.com/databus23/helm-diff
 docker-run-release:
 	git checkout master
 	git push
-	docker run -it --rm -e GITHUB_TOKEN -v $(shell pwd):$(pkg) -w $(pkg) golang:1.17.5 make bootstrap release
+	# needed to avoid "failed to initialize build cache at /.cache/go-build: mkdir /.cache: permission denied"
+	mkdir -p docker-run-release-cache
+	# uid needs to be set to avoid "error obtaining VCS status: exit status 128"
+	# Also, there needs to be a valid Linux user with the uid in the container-
+	# otherwise git-push will fail.
+	docker build -t helm-diff-release -f Dockerfile.release \
+	  --build-arg HELM_DIFF_UID=$(shell id -u) --load .
+	docker run -it --rm -e GITHUB_TOKEN \
+	-v ${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
+	-v $(shell pwd):$(pkg) \
+	-v $(shell pwd)/docker-run-release-cache:/.cache \
+	-w $(pkg) helm-diff-release make release
+
+# dist-package builds the plugin for a single platform and packs it into
+# release/helm-diff-$(1).tgz, plus a byte-identical copy named
+# release/diff-$(VERSION)-$(1).tgz. Archives wrap their content in a "diff/"
+# directory: that is the layout the install/update hooks of all previously
+# released versions expect when they download a release tarball, so it must
+# not change (issue #1076). The versioned copy exists because helm 4 derives
+# the directory it expects inside a locally installed tarball from the
+# tarball file name: "diff-<version>-<os>-<arch>.tgz" must contain "diff/"
+# (issue #1071); the historical name carries no version to strip, so it
+# cannot serve that flow.
+# Usage: $(call dist-package,<platform>,<GOOS>,<GOARCH>[,<extra env>])
+DIST_PACKAGE_FILES := README.md LICENSE plugin.yaml install-binary.sh install-binary.ps1
+define dist-package
+mkdir -p build/diff/bin
+cp $(DIST_PACKAGE_FILES) build/diff/
+goarch=$(3); bin=diff; [ "$(2)" = "windows" ] && bin=$$bin.exe; \
+	$(4) GOOS=$(2) GOARCH=$$goarch $(GO) build -o build/diff/bin/$$bin -trimpath -ldflags="$(LDFLAGS)"
+tar -C build/ -zcvf $(CURDIR)/release/helm-diff-$(1).tgz diff/
+cp $(CURDIR)/release/helm-diff-$(1).tgz $(CURDIR)/release/diff-$(VERSION)-$(1).tgz
+rm -rf build/diff
+
+endef
 
 .PHONY: dist
 dist: export COPYFILE_DISABLE=1 #teach OSX tar to not put ._* files in tar archive
 dist: export CGO_ENABLED=0
 dist:
-	rm -rf build/diff/* release/*
-	mkdir -p build/diff/bin release/
-	cp README.md LICENSE plugin.yaml build/diff
-	GOOS=linux GOARCH=amd64 go build -o build/diff/bin/diff -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-linux-amd64.tgz diff/
-	GOOS=linux GOARCH=arm64 go build -o build/diff/bin/diff -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-linux-arm64.tgz diff/
-	GOOS=freebsd GOARCH=amd64 go build -o build/diff/bin/diff -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-freebsd-amd64.tgz diff/
-	GOOS=darwin GOARCH=amd64 go build -o build/diff/bin/diff -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-macos-amd64.tgz diff/
-	GOOS=darwin GOARCH=arm64 go build -o build/diff/bin/diff -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-macos-arm64.tgz diff/
-	rm build/diff/bin/diff
-	GOOS=windows GOARCH=amd64 go build -o build/diff/bin/diff.exe -trimpath -ldflags="$(LDFLAGS)"
-	tar -C build/ -zcvf $(CURDIR)/release/helm-diff-windows-amd64.tgz diff/
+	rm -rf build/ release/*
+	mkdir -p release/
+	$(call dist-package,linux-amd64,linux,amd64)
+	$(call dist-package,linux-arm64,linux,arm64)
+	$(call dist-package,linux-armv6,linux,arm,GOARM=6)
+	$(call dist-package,linux-armv7,linux,arm,GOARM=7)
+	$(call dist-package,linux-ppc64le,linux,ppc64le)
+	$(call dist-package,linux-s390x,linux,s390x)
+	$(call dist-package,freebsd-amd64,freebsd,amd64)
+	$(call dist-package,macos-amd64,darwin,amd64)
+	$(call dist-package,macos-arm64,darwin,arm64)
+	$(call dist-package,windows-amd64,windows,amd64)
 
 .PHONY: release
 release: lint dist
-ifndef GITHUB_TOKEN
-	$(error GITHUB_TOKEN is undefined)
-endif
-	scripts/release.sh v$(VERSION) master
+	scripts/release.sh v$(VERSION)
 
 # Test for the plugin installation with `helm plugin install -v THIS_BRANCH` works
 # Useful for verifying modified `install-binary.sh` still works against various environments

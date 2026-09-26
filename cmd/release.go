@@ -4,29 +4,26 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
-	"k8s.io/helm/pkg/helm"
 
 	"github.com/databus23/helm-diff/v3/diff"
 	"github.com/databus23/helm-diff/v3/manifest"
 )
 
 type release struct {
-	client             helm.Interface
+	kubeContext        string
 	detailedExitCode   bool
-	suppressedKinds    []string
 	releases           []string
-	outputContext      int
 	includeTests       bool
-	showSecrets        bool
-	output             string
-	stripTrailingCR    bool
 	normalizeManifests bool
+	diff.Options
 }
 
 const releaseCmdLongUsage = `
-This command compares the manifests details of a different releases created from the same chart
+This command compares the manifests details of a different releases created from the same chart.
+The release name may be specified using namespace/release syntax.
 
 It can be used to compare the manifests of
 
@@ -34,6 +31,7 @@ It can be used to compare the manifests of
 	$ helm diff release [flags] release1 release2
    Example:
 	$ helm diff release my-prod my-stage
+	$ helm diff release prod/my-prod stage/my-stage
 `
 
 func releaseCmd() *cobra.Command {
@@ -42,9 +40,6 @@ func releaseCmd() *cobra.Command {
 		Use:   "release [flags] RELEASE release1 [release2]",
 		Short: "Shows diff between release's manifests",
 		Long:  releaseCmdLongUsage,
-		PreRun: func(*cobra.Command, []string) {
-			expandTLSPaths()
-		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Suppress the command usage on error. See #77 for more info
 			cmd.SilenceUsage = true
@@ -59,73 +54,70 @@ func releaseCmd() *cobra.Command {
 				return errors.New("Too few arguments to Command \"release\".\nMinimum 2 arguments required: release name-1, release name-2")
 			}
 
-			if q, _ := cmd.Flags().GetBool("suppress-secrets"); q {
-				diff.suppressedKinds = append(diff.suppressedKinds, "Secret")
-			}
+			ProcessDiffOptions(cmd.Flags(), &diff.Options)
 
 			diff.releases = args[0:]
-			if isHelm3() {
-				return diff.differentiateHelm3()
-			}
-			if diff.client == nil {
-				diff.client = createHelmClient()
-			}
-			return diff.differentiate()
+			return diff.differentiateHelm3()
 		},
 	}
 
-	releaseCmd.Flags().BoolP("suppress-secrets", "q", false, "suppress secrets in the output")
-	releaseCmd.Flags().BoolVar(&diff.showSecrets, "show-secrets", false, "do not redact secret values in the output")
 	releaseCmd.Flags().BoolVar(&diff.detailedExitCode, "detailed-exitcode", false, "return a non-zero exit code when there are changes")
-	releaseCmd.Flags().StringArrayVar(&diff.suppressedKinds, "suppress", []string{}, "allows suppression of the values listed in the diff output")
-	releaseCmd.Flags().IntVarP(&diff.outputContext, "context", "C", -1, "output NUM lines of context around changes")
 	releaseCmd.Flags().BoolVar(&diff.includeTests, "include-tests", false, "enable the diffing of the helm test hooks")
-	releaseCmd.Flags().StringVar(&diff.output, "output", "diff", "Possible values: diff, simple, template. When set to \"template\", use the env var HELM_DIFF_TPL to specify the template.")
-	releaseCmd.Flags().BoolVar(&diff.stripTrailingCR, "strip-trailing-cr", false, "strip trailing carriage return on input")
 	releaseCmd.Flags().BoolVar(&diff.normalizeManifests, "normalize-manifests", false, "normalize manifests before running diff to exclude style differences from the output")
+	releaseCmd.Flags().StringVar(&diff.kubeContext, "kube-context", "", "name of the kubeconfig context to use")
+	AddDiffOptions(releaseCmd.Flags(), &diff.Options)
 
 	releaseCmd.SuggestionsMinimumDistance = 1
-
-	if !isHelm3() {
-		addCommonCmdOptions(releaseCmd.Flags())
-	}
 
 	return releaseCmd
 }
 
 func (d *release) differentiateHelm3() error {
-	namespace := os.Getenv("HELM_NAMESPACE")
-	excludes := []string{helm3TestHook, helm2TestSuccessHook}
+	excludes := []string{manifest.Helm3TestHook, manifest.Helm2TestSuccessHook}
 	if d.includeTests {
 		excludes = []string{}
 	}
-	releaseResponse1, err := getRelease(d.releases[0], namespace)
+
+	namespace1 := os.Getenv("HELM_NAMESPACE")
+	release1 := d.releases[0]
+	if strings.Contains(release1, "/") {
+		namespace1 = strings.Split(release1, "/")[0]
+		release1 = strings.Split(release1, "/")[1]
+	}
+	releaseResponse1, err := getRelease(release1, 0, namespace1, d.kubeContext)
 	if err != nil {
 		return err
 	}
-	releaseChart1, err := getChart(d.releases[0], namespace)
+	releaseChart1, err := getChart(release1, namespace1, d.kubeContext)
 	if err != nil {
 		return err
 	}
 
-	releaseResponse2, err := getRelease(d.releases[1], namespace)
+	namespace2 := os.Getenv("HELM_NAMESPACE")
+	release2 := d.releases[1]
+	if strings.Contains(release2, "/") {
+		namespace2 = strings.Split(release2, "/")[0]
+		release2 = strings.Split(release2, "/")[1]
+	}
+	releaseResponse2, err := getRelease(release2, 0, namespace2, d.kubeContext)
 	if err != nil {
 		return err
 	}
-	releaseChart2, err := getChart(d.releases[1], namespace)
+	releaseChart2, err := getChart(release2, namespace2, d.kubeContext)
 	if err != nil {
 		return err
 	}
 
 	if releaseChart1 == releaseChart2 {
+		oldSpecs := manifest.Parse(releaseResponse1, namespace1, d.normalizeManifests, excludes...)
+		newSpecs := manifest.Parse(releaseResponse2, namespace2, d.normalizeManifests, excludes...)
+		releaseResponse1 = nil //nolint:ineffassign // nil to allow GC to reclaim raw bytes before diff computation
+		releaseResponse2 = nil //nolint:ineffassign // nil to allow GC to reclaim raw bytes before diff computation
+
 		seenAnyChanges := diff.Releases(
-			manifest.Parse(string(releaseResponse1), namespace, d.normalizeManifests, excludes...),
-			manifest.Parse(string(releaseResponse2), namespace, d.normalizeManifests, excludes...),
-			d.suppressedKinds,
-			d.showSecrets,
-			d.outputContext,
-			d.output,
-			d.stripTrailingCR,
+			oldSpecs,
+			newSpecs,
+			&d.Options,
 			os.Stdout)
 
 		if d.detailedExitCode && seenAnyChanges {
@@ -136,41 +128,6 @@ func (d *release) differentiateHelm3() error {
 		}
 	} else {
 		fmt.Printf("Error : Incomparable Releases \n Unable to compare releases from two different charts \"%s\", \"%s\". \n try helm diff release --help to know more \n", releaseChart1, releaseChart2)
-	}
-	return nil
-}
-
-func (d *release) differentiate() error {
-
-	releaseResponse1, err := d.client.ReleaseContent(d.releases[0])
-	if err != nil {
-		return prettyError(err)
-	}
-
-	releaseResponse2, err := d.client.ReleaseContent(d.releases[1])
-	if err != nil {
-		return prettyError(err)
-	}
-
-	if releaseResponse1.Release.Chart.Metadata.Name == releaseResponse2.Release.Chart.Metadata.Name {
-		seenAnyChanges := diff.Releases(
-			manifest.ParseRelease(releaseResponse1.Release, d.includeTests, d.normalizeManifests),
-			manifest.ParseRelease(releaseResponse2.Release, d.includeTests, d.normalizeManifests),
-			d.suppressedKinds,
-			d.showSecrets,
-			d.outputContext,
-			d.output,
-			d.stripTrailingCR,
-			os.Stdout)
-
-		if d.detailedExitCode && seenAnyChanges {
-			return Error{
-				error: errors.New("identified at least one change, exiting with non-zero exit code (detailed-exitcode parameter enabled)"),
-				Code:  2,
-			}
-		}
-	} else {
-		fmt.Printf("Error : Incomparable Releases \n Unable to compare releases from two different charts \"%s\", \"%s\". \n try helm diff release --help to know more \n", releaseResponse1.Release.Chart.Metadata.Name, releaseResponse2.Release.Chart.Metadata.Name)
 	}
 	return nil
 }
